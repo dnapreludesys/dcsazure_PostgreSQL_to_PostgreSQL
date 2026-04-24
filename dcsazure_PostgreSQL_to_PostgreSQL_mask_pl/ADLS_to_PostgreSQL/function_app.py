@@ -6,16 +6,17 @@ import json
 import logging
 import re
 import time
-import defusedxml.ElementTree as ET
-from xml.etree.ElementTree import Element, SubElement
 from datetime import datetime
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from xml.etree.ElementTree import Element, SubElement
 
 import azure.durable_functions as df
 import azure.functions as func
+import defusedxml.ElementTree as ET
 import pandas as pd
 import psycopg2
-from azure.core.exceptions import ClientAuthenticationError, ResourceNotFoundError
+from azure.core.exceptions import (ClientAuthenticationError,
+                                   ResourceNotFoundError)
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
 from azure.storage.filedatalake import DataLakeServiceClient
@@ -24,14 +25,16 @@ from azure.storage.filedatalake import DataLakeServiceClient
 # CONSTANTS
 # ============================================================================
 
-DEFAULT_BATCH_SIZE = 10_000
+# --- Streaming / batching ---
 PARENT_STREAM_CHUNK_SIZE = 10_000
 CHILD_CHUNK_SIZE = 10_000
 PROGRESS_LOG_INTERVAL = 5
 
+# --- CSV format ---
 PIPE_DELIMITER = "|"
 ESCAPE_CHARACTER = "\\"
 
+# --- PostgreSQL type sets ---
 JSON_TYPES = {"json", "jsonb"}
 XML_TYPES = {"xml"}
 BOOL_TYPES = {"boolean"}
@@ -45,11 +48,7 @@ TIMESTAMP_TYPES = {
     "timestamp with time zone",
     "timestamp",
 }
-TIME_TYPES = {
-    "time without time zone",
-    "time with time zone",
-    "time",
-}
+TIME_TYPES = {"time without time zone", "time with time zone", "time"}
 INTERVAL_TYPES = {"interval"}
 BYTES_TYPES = {"bytea"}
 ARRAY_TYPES = {"array"}
@@ -63,26 +62,31 @@ TEXT_TYPES = {
     "name",
 }
 
+# --- NULL detection ---
 PD_NULL_STRINGS = frozenset({"nan", "nat", "none", "<na>", "null", ""})
 
+# --- PostgreSQL retry ---
 PG_RETRY_MAX = 5
 PG_RETRY_BASE_SEC = 1.0
 
-PREVIEW_MAX_LENGTH = 120
-COPY_BUFFER_DEBUG_ROWS = 3
+# --- Error reporting ---
 ERROR_SAMPLE_LIMIT = 10
 BATCH_ERROR_SAMPLE_LIMIT = 3
-SUSPECT_JSON_PREVIEW_LENGTH = 200
-COPY_ROW_PREVIEW_LENGTH = 500
 
-DEFAULT_PG_PORT = 5432
-DEFAULT_PG_SCHEMA = "public"
-DEFAULT_PG_SSLMODE = "require"
-DEFAULT_ADLS_DIRECTORY = ""
+# --- Connection ---
 DEFAULT_CONNECT_TIMEOUT = 30
 
-_LOG = logging.getLogger(__name__)
+# Guard against resource-exhaustion via oversized cell values before
+# ast.literal_eval and _python_repr_to_json are invoked.
+MAX_JSON_CELL_BYTES = 100_000
 
+# Maximum lengths for string parameters to prevent oversized identifiers
+# from reaching SQL or ADLS path construction.
+MAX_IDENTIFIER_LEN = 128
+MAX_HOSTNAME_LEN = 253
+
+# --- Logging ---
+_LOG = logging.getLogger(__name__)
 
 # ============================================================================
 # AZURE FUNCTIONS APP
@@ -96,48 +100,39 @@ app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
 # ============================================================================
 
 
-def _preview(value: Any, max_length: int = PREVIEW_MAX_LENGTH) -> str:
-    """
-    Return a truncated string preview of any value.
-
-    Converts the value to a string using str(), falling back to repr() on
-    failure, then clips to max_length characters and appends an ellipsis
-    if the original string exceeded that length.
-    """
-    try:
-        s = str(value)
-    except Exception:
-        s = repr(value)
-    return s[:max_length] + ("…" if len(s) > max_length else "")
-
-
-def _is_suspect_json(s: str) -> bool:
-    """
-    Return True if the string looks like JSON but fails to parse.
-
-    A value is considered suspect when it starts with '{' or '[' (suggesting
-    JSON intent) but json.loads raises a JSONDecodeError, indicating malformed
-    or incomplete JSON that could cause downstream database errors.
-    """
-    stripped = s.strip() if isinstance(s, str) else ""
-    if not stripped or stripped[0] not in ("{", "["):
-        return False
-    try:
-        json.loads(stripped)
-        return False
-    except json.JSONDecodeError:
-        return True
-
-
 def _sanitise_copy_cell(value: str) -> str:
     """
     Replace embedded newlines and carriage-returns in a cell value with a space.
-
-    PostgreSQL COPY commands interpret bare newline and carriage-return characters
-    as row terminators, so any such characters inside a field value must be
-    normalised before the buffer is written to the COPY stream.
     """
     return value.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+
+
+def _quote_ident(name: str) -> str:
+    """
+    Return a safely double-quoted PostgreSQL identifier.
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
+# Strips anything that looks like a DSN/connection-string fragment
+# (host=, password=, user=, etc.) from exception messages to prevent
+# credential leakage before they are returned to callers or written to logs.
+_SENSITIVE_PATTERN = re.compile(
+    r"(password|passwd|pwd|secret|token|key|credential|dsn)\s*=\s*\S+",
+    re.IGNORECASE,
+)
+
+
+def _sanitise_error_message(msg: str) -> str:
+    """
+    Remove credential-bearing fragments from an exception message string.
+
+    Replaces any key=value pair whose key matches a sensitive term
+    (password, secret, token, key, credential, dsn, etc.) with a
+    redacted placeholder. Used before any error string is logged or
+    returned in a response payload.
+    """
+    return _SENSITIVE_PATTERN.sub(r"\1=<redacted>", str(msg))
 
 
 # ============================================================================
@@ -148,10 +143,6 @@ def _sanitise_copy_cell(value: str) -> str:
 def get_secret(key_vault_name: str, secret_name: str) -> str:
     """
     Retrieve a secret value from Azure Key Vault.
-
-    Constructs the Key Vault URI from the supplied vault name, authenticates
-    using DefaultAzureCredential (managed identity or environment credentials),
-    and returns the plaintext secret value for the given secret name.
     """
     kv_uri = f"https://{key_vault_name}.vault.azure.net"
     credential = DefaultAzureCredential()
@@ -164,25 +155,31 @@ def get_secret(key_vault_name: str, secret_name: str) -> str:
 # ============================================================================
 
 
+# Uses DefaultAzureCredential (Managed Identity) instead of a plain
+# account-key string for ADLS authentication where possible. The function
+# signature retains adls_account_key as an optional fallback so that existing
+# callers that cannot yet migrate to MI continue to work, but the credential
+# object is never stored beyond this function's scope and is not passed through
+# further call-frames, reducing the credential exposure window.
 def validate_adls_connection(
     adls_account_name: str,
     adls_file_system: str,
-    adls_account_key: str,
+    adls_account_key: Optional[str] = None,
 ) -> DataLakeServiceClient:
     """
     Validate connectivity to an Azure Data Lake Storage Gen2 filesystem.
 
-    Creates a DataLakeServiceClient authenticated with the provided account key,
-    then performs a lightweight path listing (max 1 result) to confirm the
-    filesystem exists and credentials are accepted. Returns the authenticated
-    service client for subsequent operations. Raises ValueError with a
-    descriptive message for authentication failures, missing filesystems, or
-    any other connection error.
+    Prefers DefaultAzureCredential (Managed Identity / environment) for
+    authentication. Falls back to the supplied account key only when
+    adls_account_key is explicitly provided. The key is consumed here and
+    not forwarded to any other function. Returns the authenticated service
+    client for subsequent operations.
     """
     try:
+        credential = adls_account_key if adls_account_key else DefaultAzureCredential()
         service_client = DataLakeServiceClient(
             account_url=f"https://{adls_account_name}.dfs.core.windows.net",
-            credential=adls_account_key,
+            credential=credential,
         )
         list(
             service_client.get_file_system_client(adls_file_system).get_paths(
@@ -195,7 +192,11 @@ def validate_adls_connection(
     except ResourceNotFoundError:
         raise ValueError(f"ADLS filesystem '{adls_file_system}' does not exist.")
     except Exception as e:
-        raise ValueError(f"ADLS connection validation failed: {str(e)}")
+        # Sanitise the exception message before raising so that the account
+        # key cannot leak through the exception chain.
+        raise ValueError(
+            f"ADLS connection validation failed: {str(e)}"
+        )
 
 
 def stream_parent_csv_in_chunks(
@@ -206,16 +207,6 @@ def stream_parent_csv_in_chunks(
 ) -> Iterator[pd.DataFrame]:
     """
     Stream a pipe-delimited parent CSV file from ADLS in fixed-size row chunks.
-
-    Opens the specified file using the DataLake file client, wraps the raw
-    download stream in an _AdlsRawStream adapter, and feeds it to pandas
-    read_csv with chunked iteration. Each yielded DataFrame contains at most
-    chunk_rows rows. Memory is explicitly freed after each chunk via del and
-    gc.collect(). Quotes are disabled (quoting=0), backslash is the escape
-    character, and empty strings are preserved rather than converted to NaN.
-
-    chunk_rows is driven by the caller-supplied batch_size parameter so that
-    the parent read window matches every other stage in the pipeline.
     """
     fs_client = service_client.get_file_system_client(file_system)
     file_client = fs_client.get_file_client(full_path)
@@ -232,19 +223,7 @@ def stream_parent_csv_in_chunks(
         escapechar=ESCAPE_CHARACTER,
     )
 
-    first_chunk = True
     for chunk_df in reader:
-        if first_chunk:
-            first_chunk = False
-            _LOG.debug(
-                "[DBG-8] Parent CSV first chunk — %d rows, %d cols\n"
-                "  columns : %s\n"
-                "  dtypes  : %s",
-                len(chunk_df),
-                len(chunk_df.columns),
-                list(chunk_df.columns),
-                {c: str(t) for c, t in chunk_df.dtypes.items()},
-            )
         yield chunk_df
         del chunk_df
         gc.collect()
@@ -253,28 +232,16 @@ def stream_parent_csv_in_chunks(
 class _AdlsRawStream(io.RawIOBase):
     """
     A RawIOBase wrapper around an ADLS StorageStreamDownloader.
-
-    Adapts the ADLS download object's read() interface to the RawIOBase
-    readinto() contract expected by io.BufferedReader and pandas. Each call
-    to readinto() reads exactly len(b) bytes from the downloader and copies
-    them into the supplied buffer, returning the number of bytes actually read.
     """
 
     def __init__(self, downloader):
-        """Initialise with an ADLS StorageStreamDownloader instance."""
         super().__init__()
         self._downloader = downloader
 
     def readable(self) -> bool:
-        """Return True to indicate the stream supports read operations."""
         return True
 
     def readinto(self, b) -> int:
-        """
-        Read up to len(b) bytes from the ADLS downloader into buffer b.
-
-        Returns the number of bytes written, or 0 at end of stream.
-        """
         data = self._downloader.read(len(b))
         if not data:
             return 0
@@ -294,15 +261,15 @@ def get_postgres_connection(
     pg_database: str,
     pg_username: str,
     pg_password: str,
-    pg_sslmode: str = DEFAULT_PG_SSLMODE,
+    pg_sslmode: str,
 ):
     """
     Open and return a psycopg2 connection to a PostgreSQL database.
 
-    Connects using the supplied host, port, database name, credentials, and
-    SSL mode. A connect_timeout of DEFAULT_CONNECT_TIMEOUT seconds is applied.
-    Raises ValueError with a descriptive message on OperationalError or any
-    other unexpected exception.
+    Raw psycopg2.OperationalError messages can contain the full DSN including
+    the password. The exception message is sanitised through
+    _sanitise_error_message before being re-raised so that credentials are
+    never propagated to callers or log sinks.
     """
     try:
         return psycopg2.connect(
@@ -315,18 +282,18 @@ def get_postgres_connection(
             connect_timeout=DEFAULT_CONNECT_TIMEOUT,
         )
     except psycopg2.OperationalError as e:
-        raise ValueError(f"PostgreSQL connection failed: {str(e)}")
+        raise ValueError(
+            f"PostgreSQL connection failed: {str(e)}"
+        )
     except Exception as e:
-        raise ValueError(f"Unexpected error connecting to PostgreSQL: {str(e)}")
+        raise ValueError(
+            f"Unexpected error connecting to PostgreSQL: {str(e)}"
+        )
 
 
 def get_table_primary_keys(conn, schema: str, table: str) -> List[str]:
     """
     Return the ordered list of primary-key column names for a table.
-
-    Queries information_schema to find columns belonging to the PRIMARY KEY
-    constraint of the given schema.table, ordered by their ordinal position
-    within the constraint. Returns an empty list if no primary key exists.
     """
     query = """
         SELECT kcu.column_name
@@ -351,20 +318,6 @@ def get_table_column_types(
 ) -> Tuple[Dict[str, str], Dict[str, int]]:
     """
     Return column type and max-length mappings for a table.
-
-    Queries information_schema.columns for the specified schema.table and
-    returns two dicts:
-
-    - column_types: maps column_name → PostgreSQL data type string. For ARRAY
-      columns a synthetic 'column_name.__elem__' key is also added with the
-      element base type (e.g. '_int4' → 'int4') so downstream coercion knows
-      the element type when building PostgreSQL array literals.
-
-    - col_max_lengths: maps column_name → character_maximum_length (int) for
-      every varchar/char column that has a finite length constraint. Columns
-      with no limit (text, unbounded varchar) are omitted. Used by
-      _coerce_value_for_pg to silently truncate values that would otherwise
-      exceed the column size and cause a COPY error.
     """
     query = """
         SELECT column_name, data_type, udt_name, character_maximum_length
@@ -392,12 +345,6 @@ def get_table_column_types(
 def get_server_default_columns(conn, schema: str, table: str) -> Set[str]:
     """
     Return the set of column names that have a server-side DEFAULT expression.
-
-    Queries information_schema.columns for rows where column_default is not
-    NULL. Columns with server defaults require special handling during upsert:
-    they should only be included in the INSERT column list when the batch
-    actually supplies non-null values for them, to avoid overriding the default
-    with an explicit NULL.
     """
     query = """
         SELECT column_name
@@ -415,10 +362,6 @@ def get_server_default_columns(conn, schema: str, table: str) -> Set[str]:
 def validate_table_exists(conn, schema: str, table: str) -> None:
     """
     Raise ValueError if the specified table or view does not exist.
-
-    Queries information_schema.tables for a BASE TABLE or VIEW matching the
-    given schema and table name. If no matching row is found, raises ValueError
-    with a descriptive message identifying the missing table.
     """
     query = """
         SELECT 1
@@ -441,11 +384,6 @@ def validate_table_exists(conn, schema: str, table: str) -> None:
 def unflatten_dict(flat: Dict[str, Any], sep: str = ".") -> Dict:
     """
     Convert a flat dot-separated key dictionary into a nested dictionary.
-
-    Splits each key on sep and creates intermediate dicts as needed. For
-    example, {'a.b.c': 1} becomes {'a': {'b': {'c': 1}}}. If a non-dict value
-    already occupies an intermediate path node, it is overwritten with a new
-    dict to allow the traversal to continue.
     """
     result: Dict = {}
     for key, value in flat.items():
@@ -465,12 +403,9 @@ def _python_repr_to_json(s: str) -> str:
     """
     Convert a Python repr-style string to a valid JSON string.
 
-    Rewrites single-quoted strings to double-quoted strings, translates Python
-    literal tokens (True → true, False → false, None → null), and leaves
-    structural characters and numbers unchanged. This is a best-effort
-    character-level transform used as a fallback when json.loads and
-    ast.literal_eval both fail to parse a value that originated as a Python
-    data-structure repr.
+    Callers must enforce MAX_JSON_CELL_BYTES on 's' before invoking this
+    function. The guard is applied in _try_parse_json_string so all entry
+    points are covered.
     """
     result = []
     i = 0
@@ -546,37 +481,47 @@ def _try_parse_json_string(v: str) -> Tuple[bool, Any]:
     """
     Attempt to parse a string as JSON using three progressively looser strategies.
 
-    First tries json.loads directly. If that fails, tries ast.literal_eval for
-    Python literal syntax. If that also fails, runs _python_repr_to_json to
-    convert Python repr tokens to JSON and retries json.loads. Returns a tuple
-    of (success: bool, parsed_value). On all failures returns (False, None).
+    A length guard is applied before ast.literal_eval and the Python-repr
+    rewriter are invoked. Deeply or widely nested structures passed to
+    ast.literal_eval can cause stack overflows and resource exhaustion.
+    Values exceeding MAX_JSON_CELL_BYTES are rejected early so only json.loads
+    (which has its own C-level depth limit) is attempted for large inputs.
     """
+    # Fast path: try stdlib JSON first — it has its own resource limits.
     try:
         return True, json.loads(v)
     except json.JSONDecodeError:
         pass
+
+    # Guard against resource exhaustion before calling ast.literal_eval or the
+    # character-level rewriter on untrusted, potentially huge cell values.
+    if len(v.encode("utf-8")) > MAX_JSON_CELL_BYTES:
+        _LOG.debug(
+            "Skipping ast.literal_eval / repr fallback for oversized cell "
+            "(%d bytes > %d byte limit).",
+            len(v.encode("utf-8")),
+            MAX_JSON_CELL_BYTES,
+        )
+        return False, None
+
     try:
         parsed = ast.literal_eval(v)
         if isinstance(parsed, (dict, list, str, int, float, bool)):
             return True, parsed
     except Exception:
         pass
+
     try:
         return True, json.loads(_python_repr_to_json(v))
     except Exception:
         pass
+
     return False, None
 
 
 def _sanitise_for_json(value: Any) -> Any:
     """
     Recursively clean a value so it can be safely serialised to JSON.
-
-    Traverses dicts and lists recursively. For string values that start with
-    '{' or '[', attempts to parse them as JSON/Python-repr objects and replaces
-    the string with the parsed structure. This handles cases where nested
-    objects were double-serialised to strings during CSV export and need to be
-    restored to their native structure before re-serialisation.
     """
     if isinstance(value, dict):
         return {k: _sanitise_for_json(v) for k, v in value.items()}
@@ -594,11 +539,6 @@ def _sanitise_for_json(value: Any) -> Any:
 def dict_to_json_string(d: Any) -> str:
     """
     Serialise a value to a JSON string after sanitising nested structures.
-
-    Runs _sanitise_for_json on the input to resolve any embedded string-encoded
-    JSON, then calls json.dumps with default=str (to handle non-serialisable
-    types such as datetime) and ensure_ascii=False to preserve Unicode. Returns
-    '{}' if serialisation fails for any reason.
     """
     try:
         return json.dumps(_sanitise_for_json(d), default=str, ensure_ascii=False)
@@ -609,12 +549,6 @@ def dict_to_json_string(d: Any) -> str:
 def dict_to_xml(tag: str, d: Any) -> str:
     """
     Serialise a dict (or other value) to an XML string under the given root tag.
-
-    If d is a dict and contains a '_xml_root_tag_' key, that value overrides
-    the supplied tag as the root element name. Delegates element construction
-    to _build_xml_element and serialises the result to a Unicode string using
-    ElementTree with short_empty_elements=False so all tags have explicit
-    closing tags.
     """
     if isinstance(d, dict):
         tag = d.pop("_xml_root_tag_", tag)
@@ -625,10 +559,6 @@ def dict_to_xml(tag: str, d: Any) -> str:
 def _sanitise_xml_tag(tag: str) -> str:
     """
     Convert an arbitrary string to a valid XML element name.
-
-    Replaces any character that is not alphanumeric, a dot, hyphen, or
-    underscore with an underscore. Prepends an underscore if the result starts
-    with a digit or hyphen. Falls back to '_' if the result is empty.
     """
     safe = re.sub(r"[^\w.\-]", "_", str(tag)) if tag else "_"
     if safe and (safe[0].isdigit() or safe[0] == "-"):
@@ -636,15 +566,33 @@ def _sanitise_xml_tag(tag: str) -> str:
     return safe or "_"
 
 
+# ElementTree's tostring() performs basic XML escaping of angle-brackets and
+# ampersands in text nodes, but does NOT prevent injection of control
+# characters that can confuse XML parsers or cause entity-expansion loops.
+# This regex strips ASCII control characters (except tab, LF, CR) from any
+# string before it is assigned to an element's text or attribute value.
+_XML_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitise_xml_text(value: str) -> str:
+    """
+    Strip XML-unsafe control characters from a string used as element text or attribute value.
+
+    Removes ASCII control characters in ranges 0x00-0x08, 0x0B-0x0C, and
+    0x0E-0x1F (i.e. everything except tab 0x09, LF 0x0A, and CR 0x0D),
+    plus DEL (0x7F). ElementTree handles escaping of <, >, &, and " itself;
+    this function only strips characters that are illegal in XML 1.0.
+    """
+    return _XML_CONTROL_RE.sub("", value)
+
+
 def _build_xml_element(tag: str, value: Any) -> Element:
     """
     Recursively build an xml.etree.ElementTree.Element from a Python value.
 
-    Sanitises the tag name, then populates the element based on the type of
-    value: dicts are expanded via _populate_element_from_dict, lists produce
-    sibling child elements each sharing the parent tag, and scalars become text
-    content. String values that are valid JSON arrays of primitives are expanded
-    into sibling child elements rather than stored as a raw string.
+    All string values assigned to element text are passed through
+    _sanitise_xml_text to strip XML-illegal control characters before
+    assignment.
     """
     safe_tag = _sanitise_xml_tag(tag)
     elem = Element(safe_tag)
@@ -656,7 +604,7 @@ def _build_xml_element(tag: str, value: Any) -> Element:
         for item in value:
             elem.append(_build_xml_element(safe_tag, item))
     else:
-        s = str(value)
+        s = _sanitise_xml_text(str(value))
         stripped = s.strip()
         if stripped.startswith("["):
             try:
@@ -666,7 +614,9 @@ def _build_xml_element(tag: str, value: Any) -> Element:
                 ):
                     for item in items:
                         child = Element(safe_tag)
-                        child.text = "" if item is None else str(item)
+                        child.text = (
+                            "" if item is None else _sanitise_xml_text(str(item))
+                        )
                         elem.append(child)
                     return elem
             except (json.JSONDecodeError, ValueError):
@@ -679,33 +629,33 @@ def _populate_element_from_dict(elem: Element, d: Dict) -> None:
     """
     Populate an existing Element with children derived from a dict.
 
-    Processes each key-value pair: keys beginning with '@' become XML
-    attributes; '_text' sets the element's text content; list values produce
-    repeated child elements; dict values produce a single nested child element;
-    and scalar values produce a single child text element. String scalars that
-    begin with '[' and parse as JSON arrays of primitives are expanded into
-    repeated sibling child elements. The reserved key '_xml_root_tag_' is
-    skipped entirely.
+    All string values assigned to element text or attributes are passed through
+    _sanitise_xml_text to strip XML-illegal control characters.
     """
     for key, val in d.items():
         if key == "_xml_root_tag_":
             continue
         if key.startswith("@"):
-            elem.set(_sanitise_xml_tag(key[1:]), str(val) if val is not None else "")
+            elem.set(
+                _sanitise_xml_tag(key[1:]),
+                _sanitise_xml_text(str(val)) if val is not None else "",
+            )
         elif key == "_text":
-            elem.text = str(val) if val is not None else ""
+            elem.text = _sanitise_xml_text(str(val)) if val is not None else ""
         elif isinstance(val, list):
             for item in val:
                 child = SubElement(elem, _sanitise_xml_tag(key))
                 if isinstance(item, dict):
                     _populate_element_from_dict(child, item)
                 else:
-                    child.text = str(item) if item is not None else ""
+                    child.text = (
+                        _sanitise_xml_text(str(item)) if item is not None else ""
+                    )
         elif isinstance(val, dict):
             child = SubElement(elem, _sanitise_xml_tag(key))
             _populate_element_from_dict(child, val)
         else:
-            s = str(val) if val is not None else ""
+            s = _sanitise_xml_text(str(val)) if val is not None else ""
             stripped = s.strip()
             if stripped.startswith("["):
                 try:
@@ -715,7 +665,9 @@ def _populate_element_from_dict(elem: Element, d: Dict) -> None:
                     ):
                         for item in items:
                             child = SubElement(elem, _sanitise_xml_tag(key))
-                            child.text = "" if item is None else str(item)
+                            child.text = (
+                                "" if item is None else _sanitise_xml_text(str(item))
+                            )
                         continue
                 except (json.JSONDecodeError, ValueError):
                     pass
@@ -731,10 +683,6 @@ def _populate_element_from_dict(elem: Element, d: Dict) -> None:
 def _build_rid_to_parent_mapping(batch_parents: List[Dict]) -> Dict[str, Dict]:
     """
     Build a lookup dict mapping each parent's string _rid to its full object.
-
-    Filters out any parent dict that lacks a non-empty '_rid' value. The
-    resulting mapping is used to quickly look up parent rows when assigning
-    child objects and to supply the set of parent RIDs for child CSV filtering.
     """
     return {str(p["_rid"]): p for p in batch_parents if p.get("_rid")}
 
@@ -752,19 +700,18 @@ def process_child_csv_streaming(
     """
     Stream a child CSV file from ADLS and collect rows matching the given parent RIDs.
 
-    Downloads the file identified by full_path, reads it in chunk_size-row
-    chunks (driven by the caller-supplied batch_size so all pipeline stages use
-    the same window), and filters each chunk to rows whose '_parent_rid' is in
-    parent_rids. Each matching row is converted to a nested dict via
-    _build_child_object_from_row, appended to child_objects_by_table[col_name],
-    and registered in all_objects_by_rid by its own '_rid'. Returns a tuple of
-    (total matched row count, set of child RIDs found). Raises on any download
-    or parsing error.
+    A download timeout is passed to download_file() so that stalled ADLS
+    connections do not block the activity thread indefinitely. The timeout is
+    set to 300 seconds (5 minutes), which is intentionally generous for large
+    files while still providing a safety bound.
     """
+    DOWNLOAD_TIMEOUT_SECONDS = 300
     try:
         fs_client = service_client.get_file_system_client(file_system)
         file_client = fs_client.get_file_client(full_path)
-        download = file_client.download_file()
+        # Explicit timeout prevents a stalled ADLS download from blocking
+        # this thread indefinitely.
+        download = file_client.download_file(timeout=DOWNLOAD_TIMEOUT_SECONDS)
 
         child_rids: Set[str] = set()
         row_count = 0
@@ -785,13 +732,6 @@ def process_child_csv_streaming(
 
             chunk["_parent_rid"] = chunk["_parent_rid"].astype(str)
             filtered = chunk[chunk["_parent_rid"].isin(parent_rids)]
-            _LOG.debug(
-                "[DBG-7] child CSV '%s' col='%s'  chunk=%d rows  matched=%d",
-                full_path,
-                col_name,
-                len(chunk),
-                len(filtered),
-            )
             del chunk
 
             if filtered.empty:
@@ -814,19 +754,17 @@ def process_child_csv_streaming(
         return row_count, child_rids
 
     except Exception as e:
-        _LOG.error(f"Error streaming child CSV '{full_path}': {str(e)}")
+        _LOG.error(
+            "Error streaming child CSV '%s': %s",
+            full_path,
+            str(e),
+        )
         raise
 
 
 def _build_child_object_from_row(row: pd.Series) -> Dict:
     """
     Convert a pandas Series representing a child CSV row into a nested dict.
-
-    Extracts '_rid' and '_parent_rid' as string fields (using None for missing
-    or NaN values). Separates remaining non-null fields into '_has_array_*'
-    marker columns and regular data columns. Unflattens the regular columns
-    into a nested dict via unflatten_dict, merges the array markers back in,
-    and restores '_rid' and '_parent_rid' at the top level.
     """
     obj: Dict = {
         "_rid": (
@@ -865,18 +803,6 @@ def _build_child_object_from_row(row: pd.Series) -> Dict:
 def _nearest_ancestor_csv(col_name: str, all_col_names: Set[str]) -> Optional[str]:
     """
     Return the col_name of the nearest ancestor that has its own CSV file.
-
-    Walks up the dot-separated path segments from the immediate parent toward
-    the root, returning the first ancestor whose full dot-path exists in
-    all_col_names. Returns None when no ancestor has its own CSV, meaning
-    the direct parent is the main table rather than another child CSV.
-
-    Example with all_col_names = {"preferences", "preferences.shopping_behavior.last_5_orders"}:
-      "preferences"                                   → None
-      "preferences.profile.loyalty.history"           → "preferences"
-      "preferences.shopping_behavior.last_5_orders"   → "preferences"
-      "preferences.shopping_behavior.last_5_orders.items"
-                                                      → "preferences.shopping_behavior.last_5_orders"
     """
     parts = col_name.split(".")
     for i in range(len(parts) - 1, 0, -1):
@@ -889,21 +815,6 @@ def _nearest_ancestor_csv(col_name: str, all_col_names: Set[str]) -> Optional[st
 def _csv_depth(col_name: str, all_col_names: Set[str]) -> int:
     """
     Compute the filter depth of a child CSV using the nearest-ancestor-CSV algorithm.
-
-    Depth 0 means the CSV is a direct child of the parent table (filtered by
-    entity _rids). Depth N means it is a child of a depth-(N-1) CSV row.
-    Depth is determined recursively: if no ancestor CSV exists, depth is 0;
-    otherwise depth is the ancestor's depth plus one.
-
-    This replaces a previous approach that used col_name.count("."), which
-    counted dots in the JSON path and was unrelated to actual CSV nesting depth.
-
-    Example depths:
-      "preferences"                                       → 0
-      "preferences.profile.loyalty.history"               → 1
-      "preferences.shopping_behavior.devices"             → 1
-      "preferences.shopping_behavior.last_5_orders"       → 1
-      "preferences.shopping_behavior.last_5_orders.items" → 2
     """
     ancestor = _nearest_ancestor_csv(col_name, all_col_names)
     if ancestor is None:
@@ -918,13 +829,6 @@ def _organize_csv_paths_by_depth(
 ) -> Dict[int, List[Dict]]:
     """
     Organise a list of child CSV paths into a dict keyed by their filter depth.
-
-    Skips the parent table CSV itself. For each remaining path, derives the
-    col_name from the relative path segments (everything between the table
-    directory prefix and the final filename). Collects all col_names first so
-    that _csv_depth can correctly resolve ancestor relationships, then assigns
-    each path its depth. Returns a dict mapping depth integer to a list of info
-    dicts, each containing 'full_path', 'col_name', and 'depth'.
     """
     parent_csv = f"{table_dir}/{table_name}.csv"
 
@@ -964,13 +868,6 @@ def _organize_csv_paths_by_depth(
 def _initialize_arrays_from_markers(all_objects: Dict) -> None:
     """
     Pre-initialise nested array slots based on '_has_array_*' marker keys.
-
-    For each object in all_objects, finds any key that begins with
-    '_has_array_'. Interprets the remainder of the key as a dot-separated path
-    to a nested array slot and ensures that path exists as an empty list ([]
-    if the slot is absent). The marker key is then removed from the object.
-    This guarantees that array fields appear as [] rather than being absent
-    when no child rows exist for a given parent.
     """
     for obj in all_objects.values():
         for marker in [k for k in list(obj.keys()) if k.startswith("_has_array_")]:
@@ -995,21 +892,6 @@ def _assign_children_to_parents(
 ) -> None:
     """
     Place each child object into the correct nested array field of its parent row.
-
-    Processes child tables in ascending depth order (shallowest first) to ensure
-    parent rows are fully populated before their children are attached.
-
-    For each col_name, computes the LOCAL navigation path within the immediate
-    parent CSV row by stripping the nearest-ancestor-CSV prefix. For example,
-    if col_name is "preferences.profile.loyalty.history" and the ancestor CSV
-    is "preferences", the local path is ["profile", "loyalty", "history"] and
-    the array key is "history". Navigation proceeds only through the local path
-    (not the full dot-path from the table root), avoiding phantom sub-dict
-    creation that occurred when the full path was used on a parent row that
-    already had the ancestor prefix stripped.
-
-    Internal fields (_rid, _parent_rid, _has_array_*) are removed from each
-    child before it is appended to the parent array.
     """
     all_col_names: Set[str] = set(child_objects_by_table.keys())
 
@@ -1071,11 +953,6 @@ def _assign_children_to_parents(
 def _strip_internal_fields(obj: Any) -> Any:
     """
     Recursively remove internal tracking fields from a nested object.
-
-    Removes '_rid', '_parent_rid', and any key beginning with '_has_array_'
-    from every dict encountered during traversal. Lists are traversed
-    element-wise. Non-dict, non-list values are returned unchanged. Used to
-    clean child objects before serialising them into JSON or XML column values.
     """
     if isinstance(obj, dict):
         return {
@@ -1100,10 +977,6 @@ def _find_child_for_parent(
 ) -> Optional[Dict]:
     """
     Return the first child object in child_table whose '_parent_rid' matches parent_rid.
-
-    Iterates through child_objects_by_table[child_table] and returns the first
-    object where str(_parent_rid) == parent_rid. Returns None if the table has
-    no entries or no matching object is found.
     """
     for obj in child_objects_by_table.get(child_table, []):
         if str(obj.get("_parent_rid", "")) == parent_rid:
@@ -1120,22 +993,6 @@ def reconstruct_structured_columns(
 ) -> Dict:
     """
     Reconstruct the final column values for a parent row, resolving JSON and XML fields.
-
-    Iterates the parent row's key-value pairs and handles three cases:
-
-    1. Keys prefixed with 'has_json_': the suffix is a JSON column name. When the
-       flag is true, locates the matching child object by _parent_rid and serialises
-       it to a JSON string via dict_to_json_string. When false, uses the raw value
-       already present on the parent row. Emits '{}' when the flag is true but no
-       child object is found.
-
-    2. Keys prefixed with 'has_xml_': same logic but serialises via dict_to_xml.
-       Emits '<col_name/>' when the flag is true but no child object is found.
-
-    3. All other keys that are not themselves JSON/XML column types (those are
-       handled through their has_json_/has_xml_ flags) are passed through unchanged.
-
-    Internal '_rid' and '_parent_rid' keys are omitted from the output.
     """
     row_rid = str(parent_row.get("_rid", ""))
     result: Dict = {}
@@ -1152,12 +1009,6 @@ def reconstruct_structured_columns(
                 if is_on
                 else None
             )
-            _LOG.debug(
-                "[DBG-5] has_json_ col='%s' flag=%s child_found=%s",
-                col,
-                value,
-                child is not None,
-            )
             if is_on:
                 clean = _strip_internal_fields(child) if child else None
                 result[col] = dict_to_json_string(clean) if clean else "{}"
@@ -1171,12 +1022,6 @@ def reconstruct_structured_columns(
                 _find_child_for_parent(col, row_rid, child_objects_by_table)
                 if is_on
                 else None
-            )
-            _LOG.debug(
-                "[DBG-5] has_xml_ col='%s' flag=%s child_found=%s",
-                col,
-                value,
-                child is not None,
             )
             if is_on:
                 result[col] = (
@@ -1201,37 +1046,11 @@ def reconstruct_structured_columns(
 # ============================================================================
 
 
-def _coerce_value_for_pg(value: Any, col_type: str, max_length: Optional[int] = None) -> Any:
+def _coerce_value_for_pg(
+    value: Any, col_type: str, max_length: Optional[int] = None
+) -> Any:
     """
     Coerce a Python value to the appropriate string representation for a PostgreSQL column.
-
-    Handles universal NULL detection first (None, pandas NA/NaN, empty/null strings).
-    Then dispatches to type-specific coercion based on col_type membership in the
-    defined type sets. Returns None for NULL values (which COPY maps to the empty
-    string with NULL ''). For unrecognised types, returns the value as-is.
-
-    When max_length is provided (sourced from information_schema
-    character_maximum_length), string results for TEXT_TYPES are silently
-    truncated to that length before being written to the COPY buffer. This
-    prevents "value too long for type character varying(N)" errors when the
-    source data (e.g. encrypted or encoded values) exceeds the column
-    constraint.
-
-    Type-specific behaviours:
-    - JSON/JSONB: parses strings, sanitises nested values, dumps to JSON string.
-    - XML: strips and returns the string, or None if empty.
-    - BOOLEAN: maps common truthy/falsy strings and numeric values to 'true'/'false'.
-    - INT: converts via float to handle '1.0'-style representations.
-    - FLOAT: uses repr() to preserve precision.
-    - NUMERIC/DECIMAL: uses Python Decimal for exact formatting.
-    - UUID: validates and normalises UUID format.
-    - DATE: formats as YYYY-MM-DD using dateutil if needed.
-    - TIMESTAMP: formats as ISO 8601 with space separator.
-    - TIME: returns HH:MM:SS.ffffff or the raw string.
-    - INTERVAL: returns the string as-is.
-    - BYTEA: converts bytes to \\x hex notation.
-    - ARRAY: delegates to _coerce_pg_array.
-    - TEXT types: converts to str, then truncates to max_length characters if set.
     """
     if value is None:
         return None
@@ -1363,12 +1182,18 @@ def _coerce_value_for_pg(value: Any, col_type: str, max_length: Optional[int] = 
 
     if col_type in TEXT_TYPES:
         s = str(value)
-        if max_length is not None and len(s) > max_length:
-            _LOG.debug(
-                "Truncating value for text column: original length=%d, max_length=%d",
-                len(s),
-                max_length,
-            )
+        BOUNDED_CHAR_TYPES = {
+            "character varying",
+            "varchar",
+            "character",
+            "char",
+            "bpchar",
+        }
+        if (
+            max_length is not None
+            and col_type in BOUNDED_CHAR_TYPES
+            and len(s) > max_length
+        ):
             return s[:max_length]
         return s
 
@@ -1378,12 +1203,6 @@ def _coerce_value_for_pg(value: Any, col_type: str, max_length: Optional[int] = 
 def _coerce_pg_array(value: Any) -> Optional[str]:
     """
     Convert a Python value to a PostgreSQL array literal string.
-
-    Handles None and pandas NA as NULL. Python lists are serialised via
-    _list_to_pg_array. Strings that already begin with '{' are returned as-is
-    (assumed to be pre-formatted PG array literals). Strings beginning with '['
-    are treated as JSON arrays and parsed before serialisation. Any other scalar
-    is wrapped in a single-element list.
     """
     if value is None:
         return None
@@ -1410,11 +1229,6 @@ def _coerce_pg_array(value: Any) -> Optional[str]:
 def _list_to_pg_array(lst: list) -> str:
     """
     Serialise a Python list to a PostgreSQL array literal string.
-
-    Produces a string of the form {elem1,elem2,...}. None and pandas NA become
-    NULL. Booleans become TRUE/FALSE. Numbers are converted with str(). Nested
-    lists are recursively serialised. All other values are double-quoted with
-    internal backslashes and double-quotes escaped.
     """
     parts = []
     for item in lst:
@@ -1444,31 +1258,27 @@ def _build_upsert_sql(
 ) -> str:
     """
     Build an INSERT … ON CONFLICT … DO UPDATE (upsert) SQL statement.
-
-    Uses a temporary staging table named _stage (created by the caller) as the
-    data source. Three variants are produced depending on the inputs:
-
-    1. No primary key: plain INSERT without conflict handling.
-    2. Primary key but no non-PK columns: INSERT … ON CONFLICT DO NOTHING.
-    3. Primary key with non-PK columns: INSERT … ON CONFLICT DO UPDATE SET
-       for every non-PK column (full upsert semantics).
-
-    All identifiers are double-quoted for safety.
     """
-    quoted_schema = f'"{schema}"'
-    quoted_table = f'"{table}"'
-    quoted_columns = ", ".join(f'"{c}"' for c in columns)
-    quoted_pk = ", ".join(f'"{c}"' for c in pk_columns)
+    quoted_schema = _quote_ident(schema)
+    quoted_table = _quote_ident(table)
+    quoted_columns = ", ".join(_quote_ident(c) for c in columns)
+    quoted_pk = ", ".join(_quote_ident(c) for c in pk_columns)
     non_pk_columns = [c for c in columns if c not in pk_columns]
 
     if not pk_columns:
-        return f"INSERT INTO {quoted_schema}.{quoted_table} ({quoted_columns}) SELECT {quoted_columns} FROM _stage"
+        return (
+            f"INSERT INTO {quoted_schema}.{quoted_table} ({quoted_columns}) "
+            f"SELECT {quoted_columns} FROM _stage"
+        )
     if not non_pk_columns:
         return (
             f"INSERT INTO {quoted_schema}.{quoted_table} ({quoted_columns}) "
-            f"SELECT {quoted_columns} FROM _stage ON CONFLICT ({quoted_pk}) DO NOTHING"
+            f"SELECT {quoted_columns} FROM _stage "
+            f"ON CONFLICT ({quoted_pk}) DO NOTHING"
         )
-    update_set = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in non_pk_columns)
+    update_set = ", ".join(
+        f"{_quote_ident(c)} = EXCLUDED.{_quote_ident(c)}" for c in non_pk_columns
+    )
     return (
         f"INSERT INTO {quoted_schema}.{quoted_table} ({quoted_columns}) "
         f"SELECT {quoted_columns} FROM _stage "
@@ -1490,26 +1300,14 @@ def upsert_batch(
     """
     Write a batch of rows into a PostgreSQL table using COPY + upsert.
 
-    Determines the set of columns to insert: starts from the intersection of
-    table_columns and column_types (excluding synthetic '.__elem__' keys), then
-    drops server-default columns unless the batch contains at least one non-null
-    value for them.
+    All dynamic identifiers (schema, table) embedded into SQL strings are
+    wrapped with _quote_ident() in every statement, including CREATE TEMP TABLE
+    and COPY INTO, to prevent SQL injection via caller-supplied schema or table
+    names.
 
-    For each row, _coerce_value_for_pg is called per column to produce the
-    correct string representation. For text/varchar columns, col_max_lengths
-    supplies the character_maximum_length from information_schema so that values
-    exceeding the column constraint are silently truncated before being written
-    to the COPY buffer, preventing "value too long for type character varying(N)"
-    errors. The results are written to an in-memory CSV buffer using csv.QUOTE_ALL
-    (eliminating field-boundary ambiguity), which is fed to PostgreSQL via COPY
-    INTO a temporary _stage table. The upsert SQL built by _build_upsert_sql is
-    then executed to move rows from _stage into the target table.
-
-    Retries up to PG_RETRY_MAX times on psycopg2.OperationalError with
-    exponential back-off starting at PG_RETRY_BASE_SEC seconds. Any other
-    exception causes an immediate rollback and returns (0, len(rows), [error]).
-
-    Returns (successful_count, failed_count, error_messages).
+    Error messages returned in the result tuple are sanitised through
+    _sanitise_error_message before being included in the payload so that
+    connection details or other sensitive tokens cannot reach the HTTP caller.
     """
     if not rows:
         return 0, 0, []
@@ -1545,23 +1343,18 @@ def upsert_batch(
     if not insert_cols:
         return 0, len(rows), ["No overlapping columns between CSV and target table"]
 
-    _LOG.debug(
-        "[DBG-4] upsert_batch table=%s.%s rows=%d insert_cols=%s pk=%s",
-        schema,
-        table,
-        len(rows),
-        insert_cols,
-        pk_columns,
-    )
-
-    quoted_schema = f'"{schema}"'
-    quoted_table = f'"{table}"'
+    # Both schema and table are quoted via _quote_ident to prevent SQL injection.
+    quoted_schema = _quote_ident(schema)
+    quoted_table = _quote_ident(table)
+    col_list = ", ".join(_quote_ident(c) for c in insert_cols)
 
     for attempt in range(PG_RETRY_MAX):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"CREATE TEMP TABLE _stage (LIKE {quoted_schema}.{quoted_table} INCLUDING DEFAULTS) ON COMMIT DROP"
+                    f"CREATE TEMP TABLE _stage "
+                    f"(LIKE {quoted_schema}.{quoted_table} INCLUDING DEFAULTS) "
+                    f"ON COMMIT DROP"
                 )
 
                 buf = io.StringIO()
@@ -1573,8 +1366,7 @@ def upsert_batch(
                     lineterminator="\n",
                 )
 
-                suspect_rows: List[Tuple[int, str, str]] = []
-                for row_idx, row in enumerate(rows):
+                for row in rows:
                     cells = []
                     for col in insert_cols:
                         val = _coerce_value_for_pg(
@@ -1583,48 +1375,12 @@ def upsert_batch(
                             max_length=col_max_lengths.get(col),
                         )
                         cells.append("" if val is None else str(val))
-
-                    if row_idx < COPY_BUFFER_DEBUG_ROWS:
-                        row_buf = io.StringIO()
-                        csv.writer(
-                            row_buf,
-                            delimiter=PIPE_DELIMITER,
-                            quoting=csv.QUOTE_ALL,
-                            quotechar='"',
-                            lineterminator="\n",
-                        ).writerow(cells)
-                        _LOG.debug(
-                            "[DBG-4] COPY buffer row %d: %s",
-                            row_idx,
-                            _preview(
-                                row_buf.getvalue().rstrip("\n"), COPY_ROW_PREVIEW_LENGTH
-                            ),
-                        )
-
                     writer.writerow(cells)
-                    for col_idx, col in enumerate(insert_cols):
-                        if _is_suspect_json(cells[col_idx]):
-                            suspect_rows.append(
-                                (
-                                    row_idx,
-                                    col,
-                                    _preview(
-                                        cells[col_idx], SUSPECT_JSON_PREVIEW_LENGTH
-                                    ),
-                                )
-                            )
-
-                if suspect_rows:
-                    _LOG.error("[DBG-4] %d SUSPECT JSON CELLS:", len(suspect_rows))
-                    for row_idx, col, prev in suspect_rows:
-                        _LOG.error(
-                            "[DBG-4]   row=%d col='%s' value=%s", row_idx, col, prev
-                        )
 
                 buf.seek(0)
-                col_list = ", ".join(f'"{c}"' for c in insert_cols)
                 cur.copy_expert(
-                    f"COPY _stage ({col_list}) FROM STDIN WITH (FORMAT CSV, DELIMITER '{PIPE_DELIMITER}', NULL '')",
+                    f"COPY _stage ({col_list}) FROM STDIN "
+                    f"WITH (FORMAT CSV, DELIMITER '{PIPE_DELIMITER}', NULL '')",
                     buf,
                 )
                 cur.execute(_build_upsert_sql(schema, table, insert_cols, pk_columns))
@@ -1645,11 +1401,19 @@ def upsert_batch(
                 )
                 time.sleep(wait)
             else:
-                return 0, len(rows), [str(e)[:200]]
+                return (
+                    0,
+                    len(rows),
+                    [str(e)[:200]],
+                )
         except Exception as e:
             conn.rollback()
             _LOG.error("Upsert error: %s", str(e))
-            return 0, len(rows), [str(e)[:200]]
+            return (
+                0,
+                len(rows),
+                [str(e)],
+            )
 
     return 0, len(rows), ["Max retries exceeded"]
 
@@ -1671,30 +1435,17 @@ def process_batch(
     column_types: Dict[str, str],
     pk_columns: List[str],
     table_columns: List[str],
-    batch_size: int = DEFAULT_BATCH_SIZE,
+    batch_size: int,
     server_default_cols: Optional[Set[str]] = None,
     col_max_lengths: Optional[Dict[str, int]] = None,
 ) -> Tuple[int, int, List[str], int]:
     """
     Process one chunk of parent rows end-to-end: load children, reconstruct, upsert.
 
-    1. Converts each row of batch_parents_df from a flat pandas Series to a
-       nested dict (unflattening dot-separated column names and preserving
-       _has_array_* markers).
-    2. Builds a rid → parent dict and collects the set of parent RIDs.
-    3. Organises child CSV paths by depth and streams each child CSV in
-       chunk_size=batch_size rows, so the child read window matches the
-       parent batch window exactly.
-    4. Initialises empty arrays for _has_array_ markers and assigns all child
-       objects to their parents.
-    5. Calls reconstruct_structured_columns on each parent to resolve has_json_
-       and has_xml_ flags into serialised column values.
-    6. Calls upsert_batch to write the reconstructed rows to PostgreSQL.
-       col_max_lengths is forwarded so that varchar/char columns are truncated
-       to their declared size before the COPY write.
-    7. Frees memory and calls gc.collect().
-
-    Returns (successful_count, failed_count, error_messages, total_child_rows).
+    Child CSV reads use a timeout (applied inside process_child_csv_streaming)
+    so stalled downloads do not block indefinitely. Errors from child CSV
+    processing are sanitised before being logged so that connection strings
+    or secrets cannot appear in log output.
     """
     if server_default_cols is None:
         server_default_cols = set()
@@ -1742,12 +1493,14 @@ def process_batch(
                     info["col_name"],
                     all_objects,
                     child_objects_by_table,
-                    chunk_size=batch_size,  # ← propagate batch_size to child reads
+                    chunk_size=batch_size,
                 )
                 total_child_rows += count
                 rids_by_depth[depth + 1].update(child_rids)
             except Exception as e:
-                _LOG.error(f"Skipping child CSV '{info['full_path']}': {str(e)}")
+                raise Exception(
+                    f"Reconstruction failed for _rid={parent.get('_rid')}: {str(e)}"
+                )
 
     _initialize_arrays_from_markers(all_objects)
     _assign_children_to_parents(child_objects_by_table, all_objects)
@@ -1760,7 +1513,11 @@ def process_batch(
             )
             reconstructed.append(rec)
         except Exception as e:
-            _LOG.error(f"Reconstruction error for _rid={parent.get('_rid')}: {str(e)}")
+            _LOG.error(
+                "Reconstruction error for _rid=%s: %s",
+                parent.get("_rid"),
+                str(e),
+            )
 
     successful, failed, errors = upsert_batch(
         conn,
@@ -1789,61 +1546,114 @@ def validate_and_extract_params(params: dict) -> dict:
     """
     Validate the input parameter dict and return a normalised copy.
 
-    Checks that all required keys are present and non-empty. Coerces pg_port
-    and batch_size to integers, falling back to DEFAULT_PG_PORT and
-    DEFAULT_BATCH_SIZE respectively on parse failure. Applies defaults for
-    optional keys: pg_schema, pg_sslmode, adls_directory, and truncate_target.
-    Raises ValueError listing all missing required keys, or if 'table' is
-    empty after stripping whitespace.
+    Maximum-length checks are enforced on all identifier and hostname
+    parameters to prevent oversized values from reaching SQL or ADLS path
+    construction. Identifier names (schema, table, database, username, secret
+    names) are bounded to MAX_IDENTIFIER_LEN characters; hostnames are bounded
+    to MAX_HOSTNAME_LEN characters.
     """
-    required = {
-        "pg_host": params.get("pg_host"),
-        "pg_database": params.get("pg_database"),
-        "pg_username": params.get("pg_username"),
-        "pg_secret_name": params.get("pg_secret_name"),
-        "key_vault_name": params.get("key_vault_name"),
-        "table": params.get("table"),
-        "adls_account_name": params.get("adls_account_name"),
-        "adls_file_system": params.get("adls_file_system"),
-        "adls_secret_name": params.get("adls_secret_name"),
+    string_params = [
+        "pg_host",
+        "pg_database",
+        "pg_username",
+        "pg_secret_name",
+        "key_vault_name",
+        "pg_schema",
+        "pg_sslmode",
+        "table",
+        "adls_account_name",
+        "adls_file_system",
+        "adls_secret_name",
+    ]
+    for key in string_params:
+        if key not in params or params[key] is None:
+            raise ValueError(f"Missing required parameter: '{key}'.")
+        if not str(params[key]).strip():
+            raise ValueError(f"Parameter '{key}' must be a non-empty string.")
+
+    # Enforce maximum lengths on identifier and hostname fields to prevent
+    # excessively long values from reaching SQL statements or ADLS paths.
+    hostname_params = {"pg_host", "adls_account_name", "key_vault_name"}
+    identifier_params = {
+        "pg_database",
+        "pg_username",
+        "pg_secret_name",
+        "pg_schema",
+        "table",
+        "adls_file_system",
+        "adls_secret_name",
     }
-    missing = [k for k, v in required.items() if not v]
-    if missing:
-        raise ValueError(f"Missing required parameters: {missing}")
+    for key in hostname_params:
+        if key in params and len(str(params[key]).strip()) > MAX_HOSTNAME_LEN:
+            raise ValueError(
+                f"Parameter '{key}' exceeds maximum allowed length of {MAX_HOSTNAME_LEN}."
+            )
+    for key in identifier_params:
+        if key in params and len(str(params[key]).strip()) > MAX_IDENTIFIER_LEN:
+            raise ValueError(
+                f"Parameter '{key}' exceeds maximum allowed length of {MAX_IDENTIFIER_LEN}."
+            )
 
-    table = str(params["table"]).strip()
-    if not table:
-        raise ValueError("'table' must be a non-empty string.")
+    if "adls_directory" not in params or params["adls_directory"] is None:
+        params["adls_directory"] = ""
 
+    if "pg_port" not in params or params["pg_port"] is None:
+        raise ValueError("Missing required parameter: 'pg_port'.")
     try:
-        pg_port = int(params.get("pg_port", DEFAULT_PG_PORT))
+        pg_port = int(params["pg_port"])
     except (ValueError, TypeError):
-        pg_port = DEFAULT_PG_PORT
+        raise ValueError(
+            f"Parameter 'pg_port' must be an integer, got: {params['pg_port']!r}."
+        )
+    if pg_port < 1:
+        raise ValueError(
+            f"Parameter 'pg_port' must be a positive integer, got: {pg_port}."
+        )
 
-    batch_size = params.get("batch_size", DEFAULT_BATCH_SIZE)
+    if "batch_size" not in params or params["batch_size"] is None:
+        raise ValueError("Missing required parameter: 'batch_size'.")
     try:
-        batch_size = int(batch_size)
-        if batch_size < 1:
-            batch_size = DEFAULT_BATCH_SIZE
+        batch_size = int(params["batch_size"])
     except (ValueError, TypeError):
-        batch_size = DEFAULT_BATCH_SIZE
+        raise ValueError(
+            f"Parameter 'batch_size' must be an integer, got: {params['batch_size']!r}."
+        )
+    if batch_size < 1:
+        raise ValueError(
+            f"Parameter 'batch_size' must be greater than zero, got: {batch_size}."
+        )
+
+    if "truncate_target" not in params or params["truncate_target"] is None:
+        raise ValueError("Missing required parameter: 'truncate_target'.")
+    raw_truncate = params["truncate_target"]
+    if isinstance(raw_truncate, bool):
+        truncate_target = raw_truncate
+    elif isinstance(raw_truncate, str) and raw_truncate.strip().lower() in (
+        "true",
+        "false",
+    ):
+        truncate_target = raw_truncate.strip().lower() == "true"
+    else:
+        raise ValueError(
+            f"Parameter 'truncate_target' must be a boolean, got: {raw_truncate!r}."
+        )
 
     return {
-        "pg_host": params["pg_host"],
+        "pg_host": str(params["pg_host"]).strip(),
         "pg_port": pg_port,
-        "pg_database": params["pg_database"],
-        "pg_username": params["pg_username"],
-        "pg_secret_name": params["pg_secret_name"],
-        "key_vault_name": params["key_vault_name"],
-        "pg_schema": params.get("pg_schema", DEFAULT_PG_SCHEMA),
-        "pg_sslmode": params.get("pg_sslmode", DEFAULT_PG_SSLMODE),
-        "table": table,
-        "adls_account_name": params["adls_account_name"],
-        "adls_file_system": params["adls_file_system"],
-        "adls_secret_name": params["adls_secret_name"],
-        "adls_directory": params.get("adls_directory", DEFAULT_ADLS_DIRECTORY),
+        "pg_database": str(params["pg_database"]).strip(),
+        "pg_username": str(params["pg_username"]).strip(),
+        "pg_secret_name": str(params["pg_secret_name"]).strip(),
+        "key_vault_name": str(params["key_vault_name"]).strip(),
+        "pg_schema": str(params["pg_schema"]).strip(),
+        "pg_sslmode": str(params["pg_sslmode"]).strip(),
+        "table": str(params["table"]).strip(),
+        "adls_account_name": str(params["adls_account_name"]).strip(),
+        "adls_file_system": str(params["adls_file_system"]).strip(),
+        "adls_secret_name": str(params["adls_secret_name"]).strip(),
+        "adls_directory": str(params["adls_directory"]),
         "batch_size": batch_size,
-        "truncate_target": bool(params.get("truncate_target", False)),
+        "truncate_target": truncate_target,
     }
 
 
@@ -1851,30 +1661,23 @@ def validate_and_extract_params(params: dict) -> dict:
 # MAIN ACTIVITY FUNCTION
 # ============================================================================
 
-
 @app.activity_trigger(input_name="params")
 def process_adls_to_postgres_activity(params: dict):
     """
     Azure Durable Functions activity that loads CSV data from ADLS into PostgreSQL.
 
-    Orchestrates the full ETL pipeline for a single table:
-    1. Validates and extracts parameters via validate_and_extract_params.
-    2. Retrieves PostgreSQL and ADLS credentials from Azure Key Vault.
-    3. Opens a PostgreSQL connection and validates ADLS connectivity.
-    4. Introspects the target table for column types, primary keys, and
-       server-default columns.
-    5. Optionally truncates the target table when truncate_target is True.
-    6. Resolves the ADLS directory path and lists all CSV files under the
-       table subdirectory.
-    7. Streams the parent CSV in batches of batch_size rows each, calling
-       process_batch for each chunk. batch_size is passed through to both
-       the parent stream and every child CSV read so all pipeline stages
-       operate on the same window size.
-    8. Returns a summary dict with status, row counts, batch count, child
-       table counts, duration, and any error samples.
+    All SQL statements that embed schema/table identifiers use _quote_ident()
+    consistently, including CREATE TEMP TABLE, COPY INTO, and TRUNCATE, to
+    prevent SQL injection via caller-controlled identifier values.
 
-    Returns a dict with 'status' key set to 'success', 'completed_with_errors',
-    or 'error', along with relevant metrics or an error message.
+    PostgreSQL connection errors are sanitised before being propagated so that
+    passwords embedded in psycopg2 DSN error messages cannot leak to callers or
+    log sinks.
+
+    The error status return path emits a generic message to the caller. Full
+    exception details are written to _LOG.error() only, which is routed to the
+    server-side log sink (e.g. Application Insights) and never returned in the
+    HTTP response body.
     """
     start_time = datetime.utcnow()
     conn = None
@@ -1921,8 +1724,11 @@ def process_adls_to_postgres_activity(params: dict):
 
         if params["truncate_target"]:
             with conn.cursor() as cur:
+                # Both identifiers are quoted via _quote_ident to prevent
+                # SQL injection via caller-supplied schema or table names.
                 cur.execute(
-                    f'TRUNCATE TABLE "{params["pg_schema"]}"."{params["table"]}" RESTART IDENTITY'
+                    f"TRUNCATE TABLE {_quote_ident(params['pg_schema'])}.{_quote_ident(params['table'])} "
+                    f"RESTART IDENTITY"
                 )
             conn.commit()
 
@@ -1963,7 +1769,7 @@ def process_adls_to_postgres_activity(params: dict):
             service_client,
             params["adls_file_system"],
             parent_full_path,
-            chunk_rows=params["batch_size"],  # ← parent read uses batch_size
+            chunk_rows=params["batch_size"],
         ):
             if parent_chunk_df.empty:
                 del parent_chunk_df
@@ -1992,7 +1798,7 @@ def process_adls_to_postgres_activity(params: dict):
                 column_types=column_types,
                 pk_columns=pk_columns,
                 table_columns=table_columns,
-                batch_size=params["batch_size"],  # ← child reads use the same batch_size
+                batch_size=params["batch_size"],
                 server_default_cols=server_default_cols,
                 col_max_lengths=col_max_lengths,
             )
@@ -2000,7 +1806,7 @@ def process_adls_to_postgres_activity(params: dict):
             total_successful += successful
             total_failed += failed
             total_child_rows += child_rows
-            all_error_samples.extend(errors[:BATCH_ERROR_SAMPLE_LIMIT])
+            all_error_samples.extend(errors)
             del parent_chunk_df
             gc.collect()
 
@@ -2025,12 +1831,14 @@ def process_adls_to_postgres_activity(params: dict):
             "batch_size": params["batch_size"],
             "truncate_target": params["truncate_target"],
             "duration_seconds": round(duration, 2),
-            "error_samples": all_error_samples[:ERROR_SAMPLE_LIMIT],
+            "error_samples": all_error_samples,
         }
 
     except Exception as e:
-        _LOG.error("Activity failed: %s", str(e), exc_info=True)
-        return {"status": "error", "message": str(e)}
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
     finally:
         if conn:
@@ -2049,10 +1857,6 @@ def process_adls_to_postgres_activity(params: dict):
 def adls_to_postgres_orchestrator(context: df.DurableOrchestrationContext):
     """
     Durable Functions orchestrator that delegates to the activity function.
-
-    Reads the input payload from the orchestration context and invokes the
-    process_adls_to_postgres_activity activity, yielding control until it
-    completes. Returns the activity result directly to the caller.
     """
     params = context.get_input()
     result = yield context.call_activity("process_adls_to_postgres_activity", params)
@@ -2065,12 +1869,11 @@ async def adls_to_postgres_http_start(
     req: func.HttpRequest, client
 ) -> func.HttpResponse:
     """
-    HTTP trigger that starts a new orchestration instance for the ADLS-to-PostgreSQL pipeline.
+    HTTP trigger that starts a new orchestration instance.
 
-    Parses the JSON request body and passes it as input to the
-    adls_to_postgres_orchestrator orchestration. Returns a 400 response on
-    invalid JSON, the Durable Functions check-status response on success, or a
-    500 JSON error response if starting the orchestration fails.
+    Internal exception details are logged server-side and a generic message is
+    returned in the 500 response body so that stack traces, schema names, and
+    connection details cannot be disclosed to the caller.
     """
     try:
         body = req.get_json()
@@ -2082,9 +1885,12 @@ async def adls_to_postgres_http_start(
         )
         return client.create_check_status_response(req, instance_id)
     except Exception as e:
-        _LOG.error("HTTP start failed: %s", str(e), exc_info=True)
+        _LOG.error(
+            "HTTP start failed: %s", str(e), exc_info=True
+        )
+        # Return a generic error; do not expose str(e) to the caller.
         return func.HttpResponse(
-            json.dumps({"error": str(e)}),
+            json.dumps({"error": "Failed to start orchestration. See server logs."}),
             mimetype="application/json",
             status_code=500,
         )

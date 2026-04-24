@@ -216,11 +216,11 @@
                                     "userProperties": [],
                                     "typeProperties": {
                                         "message": {
-                                            "value": "@activity('ADLS To PostgreSQL Status').output.output.failed_document_ids",
+                                            "value": "@activity('ADLS To PostgreSQL Status').output.output.message",
                                             "type": "Expression"
                                         },
                                         "errorCode": {
-                                            "value": "@activity('ADLS To PostgreSQL Status').output.output.results.failed",
+                                            "value": "@activity('ADLS To PostgreSQL Status').output.output.status",
                                             "type": "Expression"
                                         }
                                     }
@@ -252,7 +252,7 @@
                                             },
                                             "error_message": {
                                                 "value": {
-                                                    "value": "@activity('ADLS To PostgreSQL Status').output.output.failed_document_ids",
+                                                    "value": "@activity('ADLS To PostgreSQL Status').output.output.message",
                                                     "type": "Expression"
                                                 },
                                                 "type": "String"
@@ -281,7 +281,7 @@
                                             },
                                             "input_parameters": {
                                                 "value": {
-                                                    "value": "{\n  \"pg_host\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_HOST}\",\n  \"pg_port\": @{pipeline().parameters.P_POSTGRESQL_SINK_PORT},\n  \"pg_database\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_DATABASE}\",\n  \"pg_username\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_USERNAME}\",\n  \"pg_schema\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_SCHEMA}\",\n  \"table\": \"@{pipeline().parameters.P_POSTGRESQL_TABLE}\",\n\n  \"adls_account_name\": \"@{variables('STORAGE_ACCOUNT')}\",\n  \"adls_file_system\": \"@{pipeline().parameters.P_ADLS_SINK_CONTAINER}\",\n\n  \"key_vault_name\": \"@{variables('POSTGRESQL_KEY_VAULT_NAME')}\",\n  \"pg_secret_name\": \"@{variables('POSTGRESQL_SECRET_NAME')}\",\n  \"adls_secret_name\": \"@{variables('ADLS_SECRET_NAME')}\",\n\n  \"batch_size\": @{variables('ADLS_TO_POSTGRESQL_BATCH_SIZE')},\n  \"truncate_target\": @{if(equals(pipeline().parameters.P_TRUNCATE_SINK_BEFORE_WRITE, true), 'true', 'false')}\n}",
+                                                    "value": "{\n  \"pg_host\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_HOST}\",\n  \"pg_port\": @{pipeline().parameters.P_POSTGRESQL_SINK_PORT},\n  \"pg_sslmode\": \"@{variables('POSTGRESQL_SSL_MODE')}\",\n  \"pg_database\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_DATABASE}\",\n  \"pg_username\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_USERNAME}\",\n  \"pg_schema\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_SCHEMA}\",\n  \"table\": \"@{pipeline().parameters.P_POSTGRESQL_TABLE}\",\n\n  \"adls_account_name\": \"@{variables('STORAGE_ACCOUNT')}\",\n  \"adls_file_system\": \"@{pipeline().parameters.P_ADLS_SINK_CONTAINER}\",\n\n  \"key_vault_name\": \"@{variables('POSTGRESQL_KEY_VAULT_NAME')}\",\n  \"pg_secret_name\": \"@{variables('POSTGRESQL_SECRET_NAME')}\",\n  \"adls_secret_name\": \"@{variables('ADLS_SECRET_NAME')}\",\n\n  \"batch_size\": @{variables('ADLS_TO_POSTGRESQL_BATCH_SIZE')},\n  \"truncate_target\": @{if(equals(pipeline().parameters.P_TRUNCATE_SINK_BEFORE_WRITE, true), 'true', 'false')}\n}",
                                                     "type": "Expression"
                                                 },
                                                 "type": "String"
@@ -415,7 +415,7 @@
                                     "typeProperties": {
                                         "functionName": "ADLS_to_Postgres_V1",
                                         "body": {
-                                            "value": "{\n  \"pg_host\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_HOST}\",\n  \"pg_port\": @{pipeline().parameters.P_POSTGRESQL_SINK_PORT},\n  \"pg_database\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_DATABASE}\",\n  \"pg_username\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_USERNAME}\",\n  \"pg_schema\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_SCHEMA}\",\n  \"table\": \"@{pipeline().parameters.P_POSTGRESQL_TABLE}\",\n\n  \"adls_account_name\": \"@{variables('STORAGE_ACCOUNT')}\",\n  \"adls_file_system\": \"@{pipeline().parameters.P_ADLS_SINK_CONTAINER}\",\n\n  \"key_vault_name\": \"@{variables('POSTGRESQL_KEY_VAULT_NAME')}\",\n  \"pg_secret_name\": \"@{variables('POSTGRESQL_SECRET_NAME')}\",\n  \"adls_secret_name\": \"@{variables('ADLS_SECRET_NAME')}\",\n\n  \"batch_size\": @{variables('ADLS_TO_POSTGRESQL_BATCH_SIZE')},\n  \"truncate_target\": @{if(equals(pipeline().parameters.P_TRUNCATE_SINK_BEFORE_WRITE, true), 'true', 'false')}\n}",
+                                            "value": "{\n  \"pg_host\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_HOST}\",\n  \"pg_port\": @{pipeline().parameters.P_POSTGRESQL_SINK_PORT},\n  \"pg_sslmode\": \"@{variables('POSTGRESQL_SSL_MODE')}\",\n  \"pg_database\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_DATABASE}\",\n  \"pg_username\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_USERNAME}\",\n  \"pg_schema\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_SCHEMA}\",\n  \"table\": \"@{pipeline().parameters.P_POSTGRESQL_TABLE}\",\n\n  \"adls_account_name\": \"@{variables('STORAGE_ACCOUNT')}\",\n  \"adls_file_system\": \"@{pipeline().parameters.P_ADLS_SINK_CONTAINER}\",\n\n  \"key_vault_name\": \"@{variables('POSTGRESQL_KEY_VAULT_NAME')}\",\n  \"pg_secret_name\": \"@{variables('POSTGRESQL_SECRET_NAME')}\",\n  \"adls_secret_name\": \"@{variables('ADLS_SECRET_NAME')}\",\n\n  \"batch_size\": @{variables('ADLS_TO_POSTGRESQL_BATCH_SIZE')},\n  \"truncate_target\": @{if(equals(pipeline().parameters.P_TRUNCATE_SINK_BEFORE_WRITE, true), 'true', 'false')}\n}",
                                             "type": "Expression"
                                         },
                                         "headers": {
@@ -502,7 +502,7 @@
                                             },
                                             "input_parameters": {
                                                 "value": {
-                                                    "value": "{\n  \"pg_host\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_HOST}\",\n  \"pg_port\": @{pipeline().parameters.P_POSTGRESQL_SINK_PORT},\n  \"pg_database\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_DATABASE}\",\n  \"pg_username\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_USERNAME}\",\n  \"pg_schema\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_SCHEMA}\",\n  \"table\": \"@{pipeline().parameters.P_POSTGRESQL_TABLE}\",\n  \"adls_account_name\": \"@{variables('STORAGE_ACCOUNT')}\",\n  \"adls_file_system\": \"@{pipeline().parameters.P_ADLS_SINK_CONTAINER}\",\n  \"key_vault_name\": \"@{variables('POSTGRESQL_KEY_VAULT_NAME')}\",\n  \"pg_secret_name\": \"@{variables('POSTGRESQL_SECRET_NAME')}\",\n  \"adls_secret_name\": \"@{variables('ADLS_SECRET_NAME')}\",\n  \"batch_size\": @{variables('ADLS_TO_POSTGRESQL_BATCH_SIZE')},\n  \"truncate_target\": @{if(equals(pipeline().parameters.P_TRUNCATE_SINK_BEFORE_WRITE, true), 'true', 'false')}\n}",
+                                                    "value": "{\n  \"pg_host\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_HOST}\",\n  \"pg_port\": @{pipeline().parameters.P_POSTGRESQL_SINK_PORT},\n  \"pg_sslmode\": \"@{variables('POSTGRESQL_SSL_MODE')}\",\n  \"pg_database\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_DATABASE}\",\n  \"pg_username\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_USERNAME}\",\n  \"pg_schema\": \"@{pipeline().parameters.P_POSTGRESQL_SINK_SCHEMA}\",\n  \"table\": \"@{pipeline().parameters.P_POSTGRESQL_TABLE}\",\n\n  \"adls_account_name\": \"@{variables('STORAGE_ACCOUNT')}\",\n  \"adls_file_system\": \"@{pipeline().parameters.P_ADLS_SINK_CONTAINER}\",\n\n  \"key_vault_name\": \"@{variables('POSTGRESQL_KEY_VAULT_NAME')}\",\n  \"pg_secret_name\": \"@{variables('POSTGRESQL_SECRET_NAME')}\",\n  \"adls_secret_name\": \"@{variables('ADLS_SECRET_NAME')}\",\n\n  \"batch_size\": @{variables('ADLS_TO_POSTGRESQL_BATCH_SIZE')},\n  \"truncate_target\": @{if(equals(pipeline().parameters.P_TRUNCATE_SINK_BEFORE_WRITE, true), 'true', 'false')}\n}",
                                                     "type": "Expression"
                                                 },
                                                 "type": "String"
